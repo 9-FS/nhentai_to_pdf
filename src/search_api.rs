@@ -5,11 +5,31 @@ use crate::hentai::*;
 
 
 /// # Summary
-/// Searches nhentai.net for hentai with ID `hentai_id` and returns a corresponding HentaiTableRow entry. Updates database while doing so.
+/// Fetches the CDN configuration from nhentai.net v2 API.
+/// Uses GET /api/v2/cdn
 ///
 /// # Arguments
 /// - `http_client`: wreq http client
-/// - `nhentai_hentai_search_url`: nhentai.net hentai search API URL
+///
+/// # Returns
+/// - CdnConfigResponse or error
+pub async fn fetch_cdn_config(http_client: &wreq::Client) -> Result<CdnConfigResponse, Box<dyn std::error::Error + Send + Sync>>
+{
+    const CDN_URL: &str = "https://nhentai.net/api/v2/cdn";
+
+
+    let r = http_client.get(CDN_URL).send().await?;
+    log::debug!("CDN config status: {}", r.status());
+    let r_serialised: CdnConfigResponse = serde_json::from_str(r.text().await?.as_str())?;
+    log::info!("Fetched CDN config: {} image servers, {} thumb servers.", r_serialised.image_servers.len(), r_serialised.thumb_servers.len());
+
+    return Ok(r_serialised);
+}
+/// Uses v2 API: GET /api/v2/galleries/{gallery_id}
+///
+/// # Arguments
+/// - `http_client`: wreq http client
+/// - `nhentai_hentai_search_url`: nhentai.net hentai search API URL (v2 base, e.g. "https://nhentai.net/api/v2/galleries/")
 /// - `id`: hentai ID
 /// - `db`: database connection
 ///
@@ -17,40 +37,81 @@ use crate::hentai::*;
 /// - HentaiTableRow entry or error
 pub async fn search_by_id(http_client: &wreq::Client, nhentai_hentai_search_url: &str, id: u32, db: &sqlx::sqlite::SqlitePool) -> Result<HentaiTableRow, SearchByIdError>
 {
-    let r_serialised: HentaiSearchResponse; // response in json format
+    let r_serialised: GalleryDetailResponse; // response in json format
 
 
-    let r = http_client.get(format!("{nhentai_hentai_search_url}{id}").as_str()).send().await?; // search hentai
-    log::debug!("{}", r.status());
-    if r.status() != wreq::StatusCode::OK {return Err(SearchByIdError::WreqStatus {url: r.url().to_string(), status: r.status()});} // if status is not ok: something went wrong
+    let mut r: wreq::Response;
+    loop
+    {
+        match http_client.get(format!("{nhentai_hentai_search_url}{id}").as_str()).send().await // search hentai via v2 API
+        {
+            Ok(o) => r = o,
+            Err(e) => return Err(SearchByIdError::Wreq(e)),
+        }
+        log::debug!("{}", r.status());
+        if r.status() == wreq::StatusCode::TOO_MANY_REQUESTS // if status is too many requests: wait and retry
+        {
+            log::debug!("Downloading hentai metadata for \"{id}\" from \"{}\" failed with status code {}. Waiting 2 s and retrying...", r.url().to_string(), r.status());
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+        if r.status() != wreq::StatusCode::OK {return Err(SearchByIdError::WreqStatus {url: r.url().to_string(), status: r.status()});} // if status is not ok: something went wrong
+        break; // everything went well, continue with processing
+    }
     // response in json format
-    r_serialised = serde_json::from_str(r.text().await?.as_str())?; // deserialise json, get this response here to get number of pages before starting parallel workers
-    if let Err(e) = TagSearchResponse::write_to_db(vec![r_serialised.clone()], db).await // save data to database, if unsuccessful: warning
+    r_serialised = serde_json::from_str(r.text().await?.as_str())?; // deserialise json
+    if let Err(e) = r_serialised.write_to_db(db).await // save data to database, if unsuccessful: warning
     {
         log::warn!("Saving hentai \"{id}\" metadata in database failed with: {e}");
     }
 
+    // Convert upload_date from unix timestamp to chrono::DateTime
+    let upload_date = chrono::DateTime::from_timestamp(r_serialised.upload_date as i64, 0)
+        .ok_or_else(|| SearchByIdError::SerdeJson(serde::de::Error::custom(format!("Invalid unix timestamp: {}", r_serialised.upload_date))))?;
+
+    // Build page_types string from pages[].path
+    let page_types: String = r_serialised.pages.iter()
+        .map(|page|
+        {
+            match image_type_from_path(&page.path)
+            {
+                Ok(t) => format!("{t:?}"),
+                Err(e) =>
+                {
+                    log::warn!("Could not determine image type from path \"{}\": {e}", page.path);
+                    "j".to_owned()
+                }
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("");
+
     return Ok(HentaiTableRow
     {
         id: r_serialised.id,
-        media_id: r_serialised.media_id,
+        media_id: r_serialised.media_id.parse::<u32>().unwrap_or_else(|e|
+        {
+            log::warn!("Could not parse media_id \"{}\" to u32: {e}. Using 0.", r_serialised.media_id);
+            0
+        }),
         num_pages: r_serialised.num_pages,
-        page_types: r_serialised.images.pages.iter().map(|page| format!("{:?}", page.t)).collect::<Vec<String>>().join(""),
+        page_types,
         scanlator: r_serialised.scanlator,
-        title_english: r_serialised.title.english,
+        title_english: if r_serialised.title.english.is_empty() {None} else {Some(r_serialised.title.english)},
         title_japanese: r_serialised.title.japanese,
-        title_pretty: r_serialised.title.pretty,
-        upload_date: r_serialised.upload_date,
+        title_pretty: if r_serialised.title.pretty.is_empty() {None} else {Some(r_serialised.title.pretty)},
+        upload_date,
     });
 }
 
 
 /// # Summary
-/// Searches nhentai.net for all hentai ID with tags from `nhentai_tags` and returns them in a sorted list. Updates database while doing so.
+/// Searches nhentai.net for all hentai ID with tags from `nhentai_tags` and returns them in a sorted list.
+/// Uses v2 API: GET /api/v2/search
 ///
 /// # Arguments
 /// - `http_client`: wreq http client
-/// - `nhentai_tag_search_url`: nhentai.net tag search API URL
+/// - `nhentai_tag_search_url`: nhentai.net tag search API URL (v2, e.g. "https://nhentai.net/api/v2/search")
 /// - `nhentai_tags`: tags to search for
 /// - `db`: database connection
 ///
@@ -131,28 +192,30 @@ pub async fn search_by_tag(http_client: &wreq::Client, nhentai_tag_search_url: &
 
 
 /// # Summary
-/// Searches nhentai.net for all hentai ID with tag from `nhentai_tags` on page `page_no` and returns them in a list. Updates database while doing so.
+/// Searches nhentai.net for all hentai ID with tag from `nhentai_tags` on page `page_no` and returns them in a list.
+/// Uses v2 API: GET /api/v2/search
+/// Note: v2 search returns lightweight items (GalleryListItem) with tag_ids only, not full metadata.
 ///
 /// # Arguments
 /// - `http_client`: wreq http client
-/// - `nhentai_tag_search_url`: nhentai.net tag search api url
+/// - `nhentai_tag_search_url`: nhentai.net search api url (v2)
 /// - `nhentai_tags`: tags to search for
 /// - `page_no`: page number
 /// - `num_pages`: number of search result pages, if already known
-/// - `db`: database connection
+/// - `db`: database connection (unused for v2 search, kept for API compatibility)
 ///
 /// # Returns
 /// - number of search result pages
 /// - list of hentai ID to download
 /// - or error
-async fn search_by_tag_on_page(http_client: wreq::Client, nhentai_tag_search_url: String, nhentai_tags: Vec<String>, page_no: u32, num_pages: Option<u32>, db: sqlx::sqlite::SqlitePool) -> Result<(u32, Vec<u32>), SearchByTagOnPageError>
+async fn search_by_tag_on_page(http_client: wreq::Client, nhentai_tag_search_url: String, nhentai_tags: Vec<String>, page_no: u32, num_pages: Option<u32>, _db: sqlx::sqlite::SqlitePool) -> Result<(u32, Vec<u32>), SearchByTagOnPageError>
 {
     let f = scaler::Formatter::new()
         .set_scaling(scaler::Scaling::None)
         .set_rounding(scaler::Rounding::Magnitude(0)); // formatter
     let mut hentai_id_list: Vec<u32> = Vec::new(); // list of hentai id to download
     let mut r: wreq::Response; // nhentai.net api response
-    let r_serialised: TagSearchResponse; // response in json format+
+    let r_serialised: SearchResponse; // response in json format
     let r_text: String; // response text
 
 
@@ -183,10 +246,8 @@ async fn search_by_tag_on_page(http_client: wreq::Client, nhentai_tag_search_url
         Ok(o) => r_serialised = o,
         Err(e) => return Err(SearchByTagOnPageError::SerdeJson {page_no, num_pages, source: e}),
     }
-    if let Err(e) = TagSearchResponse::write_to_db(r_serialised.result.clone(), &db).await // save data to database
-    {
-        log::warn!("Saving hentai metadata page {} / {} in database failed with: {e}", f.format(page_no), num_pages.map_or("<unknown>".to_owned(), |o| f.format(o)));
-    }
+    // v2 search returns GalleryListItem with only tag_ids, not full metadata
+    // Full metadata is fetched per-gallery during download via search_by_id
 
     for hentai in r_serialised.result // collect hentai id
     {

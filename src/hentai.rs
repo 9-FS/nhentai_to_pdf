@@ -163,11 +163,12 @@ impl Hentai
     /// - `http_client`: wreq http client
     /// - `download_workers`: number of workers for parallel downloads, if 0: error
     /// - `circumvent_load_balancer`: if nhentai.net's load balancer should be circumvented and directly use random media server, only use if load balancer is broken
+    /// - `cdn_image_servers`: list of CDN image servers from /api/v2/cdn (e.g. ["i1.nhentai.net", "i2.nhentai.net", ...]), empty to use hardcoded fallback
     /// - `cleanup_temporary_files`: if temporary files should be cleaned up after download, if false: temporary images and ComicInfo.xml remain in library
     ///
     /// # Returns
     /// - nothing or error
-    pub async fn download(&self, http_client: &wreq::Client, download_workers: usize, circumvent_load_balancer: bool, cleanup_temporary_files: bool) -> Result<(), HentaiDownloadError>
+    pub async fn download(&self, http_client: &wreq::Client, download_workers: usize, circumvent_load_balancer: bool, cdn_image_servers: Vec<String>, cleanup_temporary_files: bool) -> Result<(), HentaiDownloadError>
     {
         let cbz_final_filepath: String; //filepath to final cbz in library
         let cbz_temp_filepath: String = format!("{}{}/{}.temp", self.library_path, self.id, self.id); //filepath to temporary cbz, cbz is created here and when finished moved to final location, roundabout way over temporary cbz filepath in case program gets stopped while creating cbz, so no half finished cbz remains in library, don't use real filename because appending "".temp" might then bust length limit
@@ -216,10 +217,11 @@ impl Hentai
                 let num_pages_clone: u16 = self.num_pages;
 
                 let permit: tokio::sync::OwnedSemaphorePermit = worker_sem.clone().acquire_owned().await.expect("Something closed semaphore even though it should never be closed."); // acquire semaphore
+                let cdn_image_servers_clone: Vec<String> = cdn_image_servers.clone();
                 handles.push(tokio::spawn(async move
                 {
                     let result: Option<()>;
-                    match Self::download_image(&http_client_clone, &image_url_clone, circumvent_load_balancer, &image_filepath).await // download image
+                    match Self::download_image(&http_client_clone, &image_url_clone, circumvent_load_balancer, cdn_image_servers_clone, &image_filepath).await // download image
                     {
                         Ok(_) =>
                         {
@@ -346,14 +348,15 @@ impl Hentai
     /// - `http_client`: wreq http client
     /// - `image_url`: url of the image to download
     /// - `circumvent_load_balancer`: if nhentai.net's load balancer should be circumvented and directly use random media server, only use if load balancer is broken
+    /// - `cdn_image_servers`: list of CDN image servers from /api/v2/cdn (e.g. ["i1.nhentai.net", "i2.nhentai.net", ...]), empty to use hardcoded fallback
     /// - `image_filepath`: path to save the image to
     ///
     /// # Returns
     /// - nothing or error
-    async fn download_image(http_client: &wreq::Client, image_url: &str, circumvent_load_balancer: bool, image_filepath: &str) -> Result<(), HentaiDownloadImageError>
+    async fn download_image(http_client: &wreq::Client, image_url: &str, circumvent_load_balancer: bool, cdn_image_servers: Vec<String>, image_filepath: &str) -> Result<(), HentaiDownloadImageError>
     {
-        const MEDIA_SERVERS: [&str; 4] = ["2", "3", "5", "7"]; // media servers to try if image not found, general first, after that explicit
-        let mut media_servers_randomised: Vec<&str>; // media servers in random order for load balancing
+        const HARDCODED_MEDIA_SERVERS: [&str; 4] = ["2", "3", "5", "7"]; // fallback media servers to try if image not found
+        let mut media_servers_randomised: Vec<String>; // media servers in random order for load balancing
 
 
         if let Ok(o) = tokio::fs::metadata(image_filepath).await
@@ -362,18 +365,39 @@ impl Hentai
             if o.is_dir() {return Err(HentaiDownloadImageError::BlockedByDirectory {directory_path: image_filepath.to_owned()});} // if image filepath blocked by directory: give up
         }
 
-        media_servers_randomised = MEDIA_SERVERS.to_vec();
-        media_servers_randomised.shuffle(&mut rand::rng()); // shuffle media server order
-        if !circumvent_load_balancer // if load balancer should not be circumvented
+        if !cdn_image_servers.is_empty() // use CDN servers if available
         {
-            media_servers_randomised.insert(0, ""); // prepend "" to always try general media server first with nhentai's own load balancing
+            media_servers_randomised = cdn_image_servers.to_vec();
+            media_servers_randomised.shuffle(&mut rand::rng()); // shuffle media server order
+            if !circumvent_load_balancer // if load balancer should not be circumvented
+            {
+                media_servers_randomised.insert(0, "i.nhentai.net".to_owned()); // prepend load balancer
+            }
+        }
+        else // fallback to hardcoded servers
+        {
+            let mut hardcoded: Vec<&str> = HARDCODED_MEDIA_SERVERS.to_vec();
+            hardcoded.shuffle(&mut rand::rng());
+            if !circumvent_load_balancer
+            {
+                hardcoded.insert(0, "");
+            }
+            media_servers_randomised = hardcoded.iter().map(|s| s.to_string()).collect();
         }
 
         let mut r = wreq::Response::from(http::Response::new("")); // response to store image, initialised with empty dummy response so borrow checker stops complaining about r possibly not being initialised even though it is guaranteed it is
         for (i, media_server) in media_servers_randomised.iter().enumerate() // try all media servers
         {
-            log::debug!("{}", image_url.replace("i.nhentai.net", format!("i{media_server}.nhentai.net").as_str()));
-            match http_client.get(image_url.replace("i.nhentai.net", format!("i{media_server}.nhentai.net").as_str())).send().await // tag search, page, insert media server
+            let target_url = if media_server.is_empty() // empty string means use load balancer
+            {
+                image_url.to_owned()
+            }
+            else
+            {
+                image_url.replace("i.nhentai.net", media_server.as_str())
+            };
+            log::debug!("{}", target_url);
+            match http_client.get(&target_url).send().await
             {
                 Ok(o) => r = o,
                 Err(e) =>

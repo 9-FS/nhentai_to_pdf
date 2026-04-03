@@ -4,14 +4,15 @@ use crate::connect_to_db::*;
 use crate::error::*;
 use crate::get_hentai_id_list::*;
 use crate::hentai::*;
+use crate::search_api::*;
 
 
 pub async fn main_inner(config: Config) -> Result<(), Error>
 {
     const DB_FILEPATH: &str = "./db/db.sqlite"; // database filepath
     const HTTP_TIMEOUT: u64 = 10; // connection timeout
-    const NHENTAI_HENTAI_SEARCH_URL: &str = "https://nhentai.net/api/gallery/"; // nhentai search by id api url
-    const NHENTAI_TAG_SEARCH_URL: &str = "https://nhentai.net/api/galleries/search"; // nhentai search by tag api url
+    const NHENTAI_HENTAI_SEARCH_URL: &str = "https://nhentai.net/api/v2/galleries/"; // nhentai search by id api url (v2)
+    const NHENTAI_TAG_SEARCH_URL: &str = "https://nhentai.net/api/v2/search"; // nhentai search by tag api url (v2)
     let http_client: wreq::Client; // http client
     let f0 = scaler::Formatter::new()
         .set_scaling(scaler::Scaling::None)
@@ -38,6 +39,18 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
                     Ok(o) => http_client = o,
         Err(e) => return Err(Error::WreqClientBuilder {source: e}),
     }
+
+
+    // Fetch CDN config for dynamic image server list
+    let cdn_image_servers: Vec<String> = match fetch_cdn_config(&http_client).await
+    {
+        Ok(o) => o.image_servers,
+        Err(e) =>
+        {
+            log::warn!("Fetching CDN config failed with: {e}. Using hardcoded fallback servers.");
+            Vec::new() // empty → hentai.rs will use hardcoded fallback
+        }
+    };
 
 
     'program: loop // keep running for server mode
@@ -122,7 +135,7 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
                     {
                     return Err(Error::SettingInvalid {reason: format!("Setting `DOWNLOAD_WORKERS` must have value greater than 0 or else nothing gets done.")});
                     }
-                    if let Err(e) = hentai.download(&http_client, config.DOWNLOAD_WORKERS.unwrap_or(5), config.CIRCUMVENT_LOAD_BALANCER.unwrap_or(false), config.CLEANUP_TEMPORARY_FILES.unwrap_or(true)).await
+                    if let Err(e) = hentai.download(&http_client, config.DOWNLOAD_WORKERS.unwrap_or(5), config.CIRCUMVENT_LOAD_BALANCER.unwrap_or(false), cdn_image_servers.clone(), config.CLEANUP_TEMPORARY_FILES.unwrap_or(true)).await
                     {
                     log::error!{"{e}"};
                     }
